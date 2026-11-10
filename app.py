@@ -12,6 +12,7 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, abort, request
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 load_dotenv()
@@ -20,6 +21,13 @@ VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]            # chuỗi bạn tự đặt
 PAGE_ACCESS_TOKEN = os.environ["PAGE_ACCESS_TOKEN"]  # token của Fanpage
 APP_SECRET = os.environ["APP_SECRET"]                # App Secret trong Facebook App
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")  # có trong gói miễn phí
+# Khi mô hình chính quá tải (503) hoặc hết hạn mức (429), tự chuyển sang các mô hình này (cũng miễn phí)
+FALLBACK_MODELS = [
+    m.strip()
+    for m in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash-lite,gemini-2.5-flash").split(",")
+    if m.strip()
+]
+RETRYABLE_CODES = (429, 500, 503, 504)
 GRAPH_URL = "https://graph.facebook.com/v21.0/me/messages"
 
 MAX_HISTORY = 20                 # số tin nhắn gần nhất giữ lại cho mỗi khách
@@ -146,19 +154,40 @@ def ask_ai(psid: str, user_text: str) -> str:
         )
         for m in messages
     ]
-    resp = client.models.generate_content(
-        model=MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            max_output_tokens=2048,  # chừa chỗ cho phần "suy nghĩ" của mô hình
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        max_output_tokens=2048,  # chừa chỗ cho phần "suy nghĩ" của mô hình
     )
+    try:
+        resp = generate_with_fallback(contents, config)
+    except Exception:
+        # Bỏ tin nhắn vừa thêm để lịch sử không bị lệch lượt user/model
+        with lock:
+            if history[psid] and history[psid][-1]["role"] == "user":
+                history[psid].pop()
+        raise
     reply = (resp.text or "").strip()
 
     with lock:
         history[psid].append({"role": "assistant", "content": reply})
     return reply
+
+
+def generate_with_fallback(contents, config):
+    """Gọi Gemini; nếu quá tải/hết hạn mức thì thử lại, rồi chuyển sang mô hình dự phòng."""
+    last_error = None
+    for model in [MODEL] + FALLBACK_MODELS:
+        for attempt in range(2):
+            try:
+                return client.models.generate_content(model=model, contents=contents, config=config)
+            except genai_errors.APIError as e:
+                last_error = e
+                log.warning("Gemini lỗi %s với %s (lần %d): %s", e.code, model, attempt + 1, e.message)
+                if e.code in RETRYABLE_CODES and attempt == 0:
+                    time.sleep(2)  # thử lại 1 lần với cùng mô hình
+                    continue
+                break  # sang mô hình tiếp theo
+    raise last_error
 
 
 def handle_message(psid: str, text: str) -> None:
